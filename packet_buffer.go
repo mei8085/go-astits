@@ -9,21 +9,31 @@ import (
 	"github.com/asticode/go-astikit"
 )
 
+// ErrCannotResync is returned when no trustworthy sync position can be found
+// within the configured scan and buffer limits
+var ErrCannotResync = errors.New("astits: cannot resync")
+
 // packetBuffer represents a packet buffer
 type packetBuffer struct {
-	packetSize       int
-	s                PacketSkipper
-	r                io.Reader
-	packetReadBuffer []byte
+	leftover             []byte // Bytes read ahead while resyncing, waiting to be consumed
+	packetSize           int
+	resynced             bool // Whether a resync happened since this flag was last cleared
+	resyncMaxBufferBytes int
+	resyncMaxScanBytes   int
+	s                    PacketSkipper
+	r                    io.Reader
+	packetReadBuffer     []byte
 }
 
 // newPacketBuffer creates a new packet buffer
-func newPacketBuffer(r io.Reader, packetSize int, s PacketSkipper) (pb *packetBuffer, err error) {
+func newPacketBuffer(r io.Reader, packetSize int, s PacketSkipper, resyncMaxScanBytes, resyncMaxBufferBytes int) (pb *packetBuffer, err error) {
 	// Init
 	pb = &packetBuffer{
-		packetSize: packetSize,
-		s:          s,
-		r:          r,
+		packetSize:           packetSize,
+		resyncMaxBufferBytes: resyncMaxBufferBytes,
+		resyncMaxScanBytes:   resyncMaxScanBytes,
+		s:                    s,
+		r:                    r,
 	}
 
 	// Packet size is not set
@@ -126,13 +136,20 @@ func (pb *packetBuffer) next() (p *Packet, err error) {
 
 	// Loop to make sure we return a packet even if first packets are skipped
 	for p == nil {
-		if _, err = io.ReadFull(pb.r, pb.packetReadBuffer); err != nil {
+		if err = pb.fill(); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				err = ErrNoMorePackets
 			} else {
 				err = fmt.Errorf("astits: reading %d bytes failed: %w", pb.packetSize, err)
 			}
 			return
+		}
+
+		// The packet boundary is lost
+		if pb.canResync() && pb.packetReadBuffer[0] != syncByte {
+			if err = pb.resync(); err != nil {
+				return
+			}
 		}
 
 		// Parse packet
@@ -145,4 +162,84 @@ func (pb *packetBuffer) next() (p *Packet, err error) {
 	}
 
 	return
+}
+
+// fill fills the packet read buffer, consuming leftover bytes first
+func (pb *packetBuffer) fill() (err error) {
+	b := pb.packetReadBuffer
+	for len(b) > 0 && len(pb.leftover) > 0 {
+		n := copy(b, pb.leftover)
+		pb.leftover = pb.leftover[n:]
+		b = b[n:]
+	}
+	if len(pb.leftover) == 0 {
+		pb.leftover = nil
+	}
+	if len(b) > 0 {
+		_, err = io.ReadFull(pb.r, b)
+	}
+	return
+}
+
+// canResync checks whether resyncing is enabled
+func (pb *packetBuffer) canResync() bool {
+	return pb.resyncMaxScanBytes > 0 && pb.resyncMaxBufferBytes > 0
+}
+
+// resync looks for a trustworthy sync position within the configured scan and buffer
+// limits and realigns the read buffer on it. A sync position is considered trustworthy
+// when a sync byte is followed by another sync byte exactly one packet away, so that
+// random sync bytes inside payloads are not mistaken for packet headers.
+func (pb *packetBuffer) resync() (err error) {
+	// The read buffer holds misaligned bytes
+	buf := append([]byte(nil), pb.packetReadBuffer...)
+
+	// Loop until a trustworthy sync position is found or a limit is reached
+	scanned := 0
+	for {
+		// Look for a trustworthy sync position
+		for scanned+pb.packetSize < len(buf) {
+			if buf[scanned] == syncByte && buf[scanned+pb.packetSize] == syncByte {
+				// Realign the read buffer and keep the remaining bytes for next reads
+				copy(pb.packetReadBuffer, buf[scanned:scanned+pb.packetSize])
+				pb.leftover = append([]byte(nil), buf[scanned+pb.packetSize:]...)
+				pb.resynced = true
+				return
+			}
+			scanned++
+			if scanned >= pb.resyncMaxScanBytes {
+				err = fmt.Errorf("astits: scanned %d bytes without finding a trustworthy sync position: %w", scanned, ErrCannotResync)
+				return
+			}
+		}
+
+		// Check buffer limit
+		if len(buf) >= pb.resyncMaxBufferBytes {
+			err = fmt.Errorf("astits: buffered %d bytes without finding a trustworthy sync position: %w", len(buf), ErrCannotResync)
+			return
+		}
+
+		// Read more bytes
+		l := pb.packetSize
+		if max := pb.resyncMaxBufferBytes - len(buf); max < l {
+			l = max
+		}
+		b := make([]byte, l)
+		var n int
+		if n, err = pb.r.Read(b); n > 0 {
+			buf = append(buf, b[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
+				err = ErrNoMorePackets
+			} else {
+				err = fmt.Errorf("astits: reading bytes while resyncing failed: %w", err)
+			}
+			return
+		}
+		if n == 0 {
+			err = fmt.Errorf("astits: reading bytes while resyncing failed: %w", io.ErrNoProgress)
+			return
+		}
+	}
 }

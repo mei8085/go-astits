@@ -27,9 +27,11 @@ type Demuxer struct {
 	dataBuffer []*DemuxerData
 	l          astikit.CompleteLogger
 
-	optPacketSize    int
-	optPacketsParser PacketsParser
-	optPacketSkipper PacketSkipper
+	optPacketSize           int
+	optPacketsParser        PacketsParser
+	optPacketSkipper        PacketSkipper
+	optResyncMaxBufferBytes int
+	optResyncMaxScanBytes   int
 
 	packetBuffer *packetBuffer
 	packetPool   *packetPool
@@ -94,6 +96,19 @@ func DemuxerOptPacketSkipper(s PacketSkipper) func(*Demuxer) {
 	}
 }
 
+// DemuxerOptResync returns the option to enable resyncing whenever the packet boundary is lost.
+// When a packet doesn't start with a sync byte, the demuxer scans up to maxScanBytes bytes for a
+// trustworthy sync position (a sync byte followed by another sync byte exactly one packet away)
+// while buffering at most maxBufferBytes bytes. Incomplete data accumulated before the resync is
+// dropped, but the program and stream maps are kept so that upcoming complete data can still be
+// delivered. Resyncing is disabled unless both limits are positive.
+func DemuxerOptResync(maxScanBytes, maxBufferBytes int) func(*Demuxer) {
+	return func(d *Demuxer) {
+		d.optResyncMaxScanBytes = maxScanBytes
+		d.optResyncMaxBufferBytes = maxBufferBytes
+	}
+}
+
 // NextPacket retrieves the next packet
 func (dmx *Demuxer) NextPacket() (p *Packet, err error) {
 	// Check ctx error
@@ -105,7 +120,7 @@ func (dmx *Demuxer) NextPacket() (p *Packet, err error) {
 
 	// Create packet buffer if not exists
 	if dmx.packetBuffer == nil {
-		if dmx.packetBuffer, err = newPacketBuffer(dmx.r, dmx.optPacketSize, dmx.optPacketSkipper); err != nil {
+		if dmx.packetBuffer, err = newPacketBuffer(dmx.r, dmx.optPacketSize, dmx.optPacketSkipper, dmx.optResyncMaxScanBytes, dmx.optResyncMaxBufferBytes); err != nil {
 			err = fmt.Errorf("astits: creating packet buffer failed: %w", err)
 			return
 		}
@@ -117,6 +132,14 @@ func (dmx *Demuxer) NextPacket() (p *Packet, err error) {
 			err = fmt.Errorf("astits: fetching next packet from buffer failed: %w", err)
 		}
 		return
+	}
+
+	// The packet buffer resynced: drop incomplete data so that it doesn't corrupt
+	// upcoming data, but keep the program and stream maps since they're still valid
+	if dmx.packetBuffer.resynced {
+		dmx.packetBuffer.resynced = false
+		dmx.packetPool = newPacketPool(dmx.programMap)
+		dmx.l.Debug("astits: resynced on a trustworthy sync position")
 	}
 	return
 }

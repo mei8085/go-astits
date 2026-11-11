@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -156,6 +157,116 @@ func TestDemuxerNextDataPATPMT(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, uint16(0x1000), d.FirstPacket.Header.PID)
 	assert.NotNil(t, d.PMT)
+}
+
+func patPacketBytes() []byte {
+	return hexToBytes(`474000100000b00d0001c100000001f0002ab104b2ffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffff`)
+}
+
+func pmtPacketBytes() []byte {
+	return hexToBytes(`475000100002b0170001c10000e100f0001be100f0000fe101f0002f44
+	b99bffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+	ffffffffffffffffff`)
+}
+
+func TestDemuxerNextDataResync(t *testing.T) {
+	// Build a stream made of:
+	//   - a PAT and a PMT packet
+	//   - the first packet of a PES payload that will never be completed
+	//   - 37 garbage bytes, one of them being a sync byte to make sure random
+	//     sync bytes are not mistaken for packet headers
+	//   - a complete PES packet
+	//   - a PAT packet
+	pesIncomplete, _ := resyncPacket(PacketHeader{
+		ContinuityCounter:         0,
+		HasPayload:                true,
+		PayloadUnitStartIndicator: true,
+		PID:                       0x100,
+	}, hexToBytes(`000001be01f4`)) // PES packet length is 500, the payload is incomplete
+	pesComplete, _ := resyncPacket(PacketHeader{
+		ContinuityCounter:         1,
+		HasPayload:                true,
+		PayloadUnitStartIndicator: true,
+		PID:                       0x100,
+	}, hexToBytes(`000001be0004deadbeef`))
+	garbage := make([]byte, 37)
+	garbage[1] = syncByte
+	var stream []byte
+	stream = append(stream, patPacketBytes()...)
+	stream = append(stream, pmtPacketBytes()...)
+	stream = append(stream, pesIncomplete...)
+	stream = append(stream, garbage...)
+	stream = append(stream, pesComplete...)
+	stream = append(stream, patPacketBytes()...)
+
+	// Without resync, fetching data fails
+	dmx := NewDemuxer(context.Background(), bytes.NewReader(stream), DemuxerOptPacketSize(188))
+	d, err := dmx.NextData()
+	assert.NoError(t, err)
+	assert.NotNil(t, d.PAT)
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.NotNil(t, d.PMT)
+	_, err = dmx.NextData()
+	assert.True(t, errors.Is(err, ErrPacketMustStartWithASyncByte))
+
+	// With resync, complete data keeps being delivered after the desync
+	dmx = NewDemuxer(context.Background(), bytes.NewReader(stream), DemuxerOptPacketSize(188), DemuxerOptResync(1024, 2048))
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.NotNil(t, d.PAT)
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.NotNil(t, d.PMT)
+
+	// The incomplete PES payload has been dropped, the complete one is delivered
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.Equal(t, uint16(0x100), d.PID)
+	assert.NotNil(t, d.PES)
+	assert.Equal(t, hexToBytes(`deadbeef`), d.PES.Data)
+
+	// The program and stream maps have been kept
+	assert.True(t, dmx.programMap.existsUnlocked(0x1000))
+	assert.True(t, dmx.streamMap.existsUnlocked(0x100))
+
+	// Data following the desync is delivered
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.NotNil(t, d.PAT)
+
+	// No more packets
+	_, err = dmx.NextData()
+	assert.EqualError(t, err, ErrNoMorePackets.Error())
+}
+
+func TestDemuxerNextDataResyncSyncedStream(t *testing.T) {
+	// Enabling resync on a synced stream doesn't change the output
+	r := bytes.NewReader(append(patPacketBytes(), pmtPacketBytes()...))
+	dmx := NewDemuxer(context.Background(), r, DemuxerOptPacketSize(188), DemuxerOptResync(1024, 2048))
+
+	d, err := dmx.NextData()
+	assert.NoError(t, err)
+	assert.Equal(t, uint16(0), d.FirstPacket.Header.PID)
+	assert.NotNil(t, d.PAT)
+
+	d, err = dmx.NextData()
+	assert.NoError(t, err)
+	assert.Equal(t, uint16(0x1000), d.FirstPacket.Header.PID)
+	assert.NotNil(t, d.PMT)
+
+	_, err = dmx.NextData()
+	assert.EqualError(t, err, ErrNoMorePackets.Error())
 }
 
 func TestDemuxerRewind(t *testing.T) {
