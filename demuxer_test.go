@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -125,6 +126,54 @@ func TestDemuxerNextDataUnknownDataPackets(t *testing.T) {
 	d, err := dmx.NextData()
 	assert.Equal(t, (*DemuxerData)(nil), d)
 	assert.EqualError(t, err, ErrNoMorePackets.Error())
+}
+
+func TestDemuxerNextDataDiscardsIncompletePESAtEOF(t *testing.T) {
+	// Declare more PES bytes than the stream contains. Completion must not be
+	// inferred from EOF.
+	raw, _ := packetShort(PacketHeader{
+		ContinuityCounter:         0,
+		HasPayload:                true,
+		PayloadUnitStartIndicator: true,
+		PID:                       256,
+	}, []byte{0, 0, 1, 0xe0, 0x10, 0x00, 0x80, 0, 0, 42})
+
+	dmx := NewDemuxer(context.Background(), bytes.NewReader(raw), DemuxerOptPacketSize(MpegTsPacketSize))
+	d, err := dmx.NextData()
+	assert.Nil(t, d)
+	assert.True(t, errors.Is(err, ErrNoMorePackets))
+	assert.Empty(t, dmx.packetPool.b)
+}
+
+func TestDemuxerNextDataDiscardsIncompletePSIAtEOF(t *testing.T) {
+	// A PAT section starts in this packet but its declared section is truncated.
+	raw, _ := packetShort(PacketHeader{
+		ContinuityCounter:         0,
+		HasPayload:                true,
+		PayloadUnitStartIndicator: true,
+		PID:                       PIDPAT,
+	}, []byte{0, uint8(PSITableIDPAT), 0xb1, 0x11, 0, 1, 0xc1})
+
+	dmx := NewDemuxer(context.Background(), bytes.NewReader(raw), DemuxerOptPacketSize(MpegTsPacketSize))
+	d, err := dmx.NextData()
+	assert.Nil(t, d)
+	assert.True(t, errors.Is(err, ErrNoMorePackets))
+	assert.Empty(t, dmx.packetPool.b)
+}
+
+func TestDemuxerNextDataReleasesAssemblyOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	dmx := NewDemuxer(ctx, bytes.NewReader(nil), DemuxerOptPacketSize(MpegTsPacketSize))
+	dmx.packetPool.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 256, HasPayload: true},
+		Payload: []byte{1, 2, 3, 4},
+	})
+
+	cancel()
+	d, err := dmx.NextData()
+	assert.Nil(t, d)
+	assert.True(t, errors.Is(err, context.Canceled))
+	assert.Empty(t, dmx.packetPool.b)
 }
 
 func TestDemuxerNextDataPATPMT(t *testing.T) {

@@ -47,21 +47,11 @@ func parseData(ps []*Packet, prs PacketsParser, pm *programMap, esm *elementaryS
 		}
 	}
 
-	// Get payload length
-	var l int
-	for _, p := range ps {
-		l += len(p.Payload)
-	}
-
-	// Get the slice for payload from pool
-	payload := bytesPool.get(l)
+	// Build a temporary, demuxer-owned aggregate. Parsers copy every byte field
+	// that becomes part of PES/PSI output; scalar no-copy reads do not outlive this
+	// call, so the buffer can be pooled immediately after parsing returns.
+	payload := joinPacketPayloads(ps)
 	defer bytesPool.put(payload)
-
-	// Append payload
-	var c int
-	for _, p := range ps {
-		c += copy(payload.s[c:], p.Payload)
-	}
 
 	// Create reader
 	i := astikit.NewBytesIterator(payload.s)
@@ -69,7 +59,8 @@ func parseData(ps []*Packet, prs PacketsParser, pm *programMap, esm *elementaryS
 	// Parse PID
 	pid := ps[0].Header.PID
 
-	// Copy first packet headers, so we can safely deallocate original payload
+	// Keep only value headers in the returned data. The packet's payload remains
+	// owned by the assembly layer until the complete packet set is released.
 	fp := &Packet{
 		Header:          ps[0].Header,
 		AdaptationField: ps[0].AdaptationField,
@@ -117,6 +108,20 @@ func isPSIPayload(pid uint16, pm *programMap, esm *elementaryStreamMap) bool {
 			!esm.existsUnlocked(pid)) // for non-DVB
 }
 
+func joinPacketPayloads(ps []*Packet) *bytesPoolItem {
+	var l int
+	for _, p := range ps {
+		l += len(p.Payload)
+	}
+
+	payload := bytesPool.get(l)
+	var offset int
+	for _, p := range ps {
+		offset += copy(payload.s[offset:], p.Payload)
+	}
+	return payload
+}
+
 // isPESPayload checks whether the payload is a PES one
 func isPESPayload(i []byte) bool {
 	// Packet is not big enough
@@ -130,21 +135,8 @@ func isPESPayload(i []byte) bool {
 
 // isPSIComplete checks whether we have sufficient amount of packets to parse PSI
 func isPSIComplete(ps []*Packet) bool {
-	// Get payload length
-	var l int
-	for _, p := range ps {
-		l += len(p.Payload)
-	}
-
-	// Get the slice for payload from pool
-	payload := bytesPool.get(l)
+	payload := joinPacketPayloads(ps)
 	defer bytesPool.put(payload)
-
-	// Append payload
-	var o int
-	for _, p := range ps {
-		o += copy(payload.s[o:], p.Payload)
-	}
 
 	// Create reader
 	i := astikit.NewBytesIterator(payload.s)
@@ -156,7 +148,11 @@ func isPSIComplete(ps []*Packet) bool {
 	}
 
 	// Pointer filler bytes
-	i.Skip(int(b))
+	pointerField := int(b)
+	if pointerField > i.Len()-i.Offset() {
+		return false
+	}
+	i.Skip(pointerField)
 
 	for i.HasBytesLeft() {
 
@@ -166,9 +162,10 @@ func isPSIComplete(ps []*Packet) bool {
 			return false
 		}
 
-		// Check whether we need to stop the parsing
+		// A null/unknown table ID marks stuffing or an unparsable table boundary.
+		// Every section before it must already be fully covered by the packets.
 		if shouldStopPSIParsing(PSITableID(b)) {
-			break
+			return true
 		}
 
 		// Get PSI section length
@@ -178,10 +175,19 @@ func isPSIComplete(ps []*Packet) bool {
 			return false
 		}
 
-		i.Skip(int(binary.BigEndian.Uint16(bs) & 0x0fff))
+		sectionLength := int(binary.BigEndian.Uint16(bs) & 0x0fff)
+		// A section_length field covers the bytes following its own two bytes.
+		// The MPEG-TS limit keeps a damaged stream from accumulating an unbounded
+		// table while waiting for a section that cannot fit in a TS payload.
+		if sectionLength == 0 || sectionLength > 1021 || i.Offset()+sectionLength > i.Len() {
+			return false
+		}
+		i.Skip(sectionLength)
 	}
 
-	return i.Len() >= i.Offset()
+	// All bytes must be covered by a declared section. Any short section means
+	// another transport packet is still required.
+	return i.Offset() == i.Len()
 }
 
 // isPESComplete checks whether payload fully contains PES packet
@@ -198,26 +204,20 @@ func isPESComplete(ps []*Packet) bool {
 		return false
 	}
 
-	// Get payload length
+	declaredLength := int(binary.BigEndian.Uint16(header[4:]))
+
 	var l int
 	for _, p := range ps {
 		l += len(p.Payload)
 	}
 
 	// PES_packet_length excludes the six-byte fixed header.
-	if l < len(header)+int(binary.BigEndian.Uint16(header[4:])) {
+	if l < len(header)+declaredLength {
 		return false
 	}
 
-	// Get the slice for payload from pool
-	payload := bytesPool.get(l)
+	payload := joinPacketPayloads(ps)
 	defer bytesPool.put(payload)
-
-	// Append payload
-	var o int
-	for _, p := range ps {
-		o += copy(payload.s[o:], p.Payload)
-	}
 
 	// Create reader
 	i := astikit.NewBytesIterator(payload.s)
@@ -237,5 +237,5 @@ func isPESComplete(ps []*Packet) bool {
 		return false
 	}
 
-	return i.Len() >= dataEnd
+	return dataEnd <= i.Len()
 }

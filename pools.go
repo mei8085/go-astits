@@ -2,7 +2,9 @@ package astits
 
 import "sync"
 
-// bytesPool global variable is used to ease access to pool from any place of the code
+// bytesPool holds buffers used only for a single parse call. Anything that escapes
+// to a returned PES/PSI object is explicitly allocated (or copied by the parsers),
+// so putting the temporary aggregate buffer back here cannot invalidate caller data.
 var bytesPool = &bytesPooler{
 	sp: sync.Pool{
 		New: func() interface{} {
@@ -19,8 +21,7 @@ type bytesPoolItem struct {
 	s []byte
 }
 
-// bytesPooler is a pool for temporary payload in parseData()
-// Don't use it anywhere else to avoid pool pollution
+// bytesPooler is a pool for temporary payload in the demux parser.
 type bytesPooler struct {
 	sp sync.Pool
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/asticode/go-astikit"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseData(t *testing.T) {
@@ -73,6 +74,40 @@ func TestParseData(t *testing.T) {
 	), ds)
 }
 
+func TestParseDataReturnedBytesOutliveNextParse(t *testing.T) {
+	pm := newProgramMap()
+	esm := newElementaryStreamMap()
+	pm.setUnlocked(uint16(256), uint16(1))
+
+	// A complete bounded PES. Parsing another unit reuses the temporary aggregate
+	// buffer, but PES.Data must remain owned by the returned PESData.
+	pes := []byte{0, 0, 1, 0xe0, 0, 4, 0x80, 0, 0, 42}
+	pesPackets := []*Packet{
+		{Header: PacketHeader{PID: 257}, Payload: pes[:4]},
+		{Header: PacketHeader{PID: 257}, Payload: pes[4:]},
+	}
+	pesData, err := parseData(pesPackets, nil, pm, esm)
+	assert.NoError(t, err)
+	require.Len(t, pesData, 1)
+
+	// Reuse the parser and its temporary payload pool with a PSI section.
+	psiPayload := psiBytes()
+	psiPackets := []*Packet{
+		{Header: PacketHeader{PID: 256}, Payload: psiPayload[:73]},
+		{Header: PacketHeader{PID: 256}, Payload: psiPayload[73:]},
+	}
+	_, err = parseData(psiPackets, nil, pm, esm)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{42}, pesData[0].PES.Data)
+
+	// A second PSI parse must leave the previously delivered program tables intact.
+	psiData, err := parseData(psiPackets, nil, pm, esm)
+	assert.NoError(t, err)
+	_, err = parseData(pesPackets, nil, pm, esm)
+	assert.NoError(t, err)
+	assert.Equal(t, psi.toData(&Packet{Header: psiPackets[0].Header}, 256), psiData)
+}
+
 func TestIsPSIPayload(t *testing.T) {
 	pm := newProgramMap()
 	esm := newElementaryStreamMap()
@@ -100,6 +135,35 @@ func TestIsPESPayload(t *testing.T) {
 	buf.Reset()
 	w.Write("000000000000000000000001")
 	assert.True(t, isPESPayload(buf.Bytes()))
+}
+
+func TestIsPSIComplete(t *testing.T) {
+	// Pointer field 0, PAT table ID, section_length 5, followed by exactly the
+	// five declared bytes.
+	complete := []byte{0, uint8(PSITableIDPAT), 0xb0, 0x05, 0, 1, 0xc1, 0x00, 0x01}
+	assert.True(t, isPSIComplete([]*Packet{{Payload: complete}}))
+
+	// The same section is waiting for its final transport payload.
+	partial := complete[:len(complete)-1]
+	assert.False(t, isPSIComplete([]*Packet{{Payload: partial}}))
+
+	// A terminating/stuffing table ID means all preceding complete sections are
+	// enough; the parser stops there and does not require trailing stuffing.
+	withStuffing := append(append([]byte{}, complete...), 0xff)
+	assert.True(t, isPSIComplete([]*Packet{{Payload: withStuffing}}))
+
+	// A stuffing table ID on its own is already a complete PSI packet boundary.
+	assert.True(t, isPSIComplete([]*Packet{{Payload: []byte{0, 0xff}}}))
+	assert.True(t, isPSIComplete([]*Packet{{Payload: []byte{0}}}))
+
+	// A damaged length that cannot fit into any MPEG-TS PSI section must be
+	// rejected instead of accumulating packets forever.
+	oversized := []byte{0, uint8(PSITableIDPAT), 0xbf, 0xfd}
+	assert.False(t, isPSIComplete([]*Packet{{Payload: oversized}}))
+
+	// A pointer field cannot point past the bytes currently available.
+	invalidPointer := []byte{42, uint8(PSITableIDPAT), 0xb0, 0x05, 0, 1, 0xc1, 0, 1}
+	assert.False(t, isPSIComplete([]*Packet{{Payload: invalidPointer}}))
 }
 
 func BenchmarkIsPESComplete(b *testing.B) {

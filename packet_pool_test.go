@@ -22,6 +22,23 @@ func TestIsSameAsPrevious(t *testing.T) {
 	assert.True(t, isSameAsPrevious([]*Packet{{Header: PacketHeader{ContinuityCounter: 1}}}, &Packet{Header: PacketHeader{ContinuityCounter: 1, HasPayload: true}}))
 }
 
+func TestPacketAccumulatorDiscontinuityReleasesBackingArray(t *testing.T) {
+	acc := newPacketAccumulator(256, nil)
+	acc.add(&Packet{
+		Header:  PacketHeader{PID: 256, ContinuityCounter: 0, HasPayload: true},
+		Payload: make([]byte, 4096),
+	})
+
+	acc.add(&Packet{
+		Header:  PacketHeader{PID: 256, ContinuityCounter: 5, HasPayload: true},
+		Payload: []byte{1},
+	})
+
+	// The damaged packet set has been released and only the replacement packet remains.
+	assert.Len(t, acc.q, 1)
+	assert.Equal(t, 1, cap(acc.q))
+}
+
 func TestPacketPool(t *testing.T) {
 	b := newPacketPool(nil)
 	ps := b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 0, HasPayload: true, PID: 1}})
@@ -48,6 +65,34 @@ func TestPacketPool(t *testing.T) {
 	assert.Equal(t, uint16(2), ps[0].Header.PID)
 	ps = b.dumpUnlocked()
 	assert.Len(t, ps, 0)
+}
+
+func TestPacketPoolResetUnlocked(t *testing.T) {
+	b := newPacketPool(nil)
+	flushed := b.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 1, ContinuityCounter: 0, HasPayload: true, PayloadUnitStartIndicator: true},
+		Payload: []byte{1},
+	})
+	assert.Empty(t, flushed)
+	b.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 1, ContinuityCounter: 1, HasPayload: true, PayloadUnitStartIndicator: true},
+		Payload: make([]byte, 4096),
+	})
+	flushed = b.dumpUnlocked()
+	assert.Len(t, flushed, 1)
+
+	b.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 2, ContinuityCounter: 0, HasPayload: true},
+		Payload: make([]byte, 4096),
+	})
+
+	b.resetUnlocked()
+
+	// The reset owns only packets still being assembled. Packets already returned
+	// to the caller remain valid and unaffected.
+	assert.Len(t, flushed, 1)
+	assert.Empty(t, b.b)
+	assert.Empty(t, b.dumpUnlocked())
 }
 
 func TestPacketPoolWithRarePackets(t *testing.T) {

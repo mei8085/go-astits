@@ -137,31 +137,15 @@ func (dmx *Demuxer) NextData() (d *DemuxerData, err error) {
 	for {
 		// Get next packet
 		if p, err = dmx.NextPacket(); err != nil {
-			// If the end of the stream has been reached, we dump the packet pool
+			// If the end of the stream has been reached, discard everything still
+			// being assembled. Only complete units are returned while the stream is
+			// running; the remainder cannot gain another packet and must not become
+			// either a partial result or a long-lived packet-pool allocation.
 			if err == ErrNoMorePackets {
-				for {
-					// Dump packet pool
-					if ps = dmx.packetPool.dumpUnlocked(); len(ps) == 0 {
-						break
-					}
-
-					// Parse data
-					var errParseData error
-					if ds, errParseData = parseData(ps, dmx.optPacketsParser, dmx.programMap, dmx.streamMap); errParseData != nil {
-						// Log error as there may be some incomplete data here
-						// We still want to try to parse all packets, in case final data is complete
-						dmx.l.Error(fmt.Errorf("astits: parsing data failed: %w", errParseData))
-						continue
-					}
-
-					// Update data
-					if d = dmx.updateData(ds); d != nil {
-						err = nil
-						return
-					}
-				}
+				dmx.packetPool.resetUnlocked()
 				return
 			}
+			dmx.packetPool.resetUnlocked()
 			err = fmt.Errorf("astits: fetching next packet failed: %w", err)
 			return
 		}

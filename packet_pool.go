@@ -25,12 +25,9 @@ func (b *packetAccumulator) add(p *Packet) (ps []*Packet) {
 
 	// Empty buffer if we detect a discontinuity
 	if hasDiscontinuity(mps, p) {
-		// Reset current slice or make new
-		if cap(mps) > 0 {
-			mps = mps[:0]
-		} else {
-			mps = make([]*Packet, 0, 10)
-		}
+		// Drop the whole backing array. Reusing a large slice here would keep all
+		// packets from the damaged unit alive even though they can never complete it.
+		mps = nil
 	}
 
 	// Throw away packet if it's the same as the previous one
@@ -107,6 +104,12 @@ func (b *packetPool) addUnlocked(p *Packet) (ps []*Packet) {
 
 	// Add to the accumulator
 	return acc.add(p)
+}
+
+// resetUnlocked releases all packets still being assembled. Packets handed out in
+// a previous addUnlocked result are owned by that call and are not affected.
+func (b *packetPool) resetUnlocked() {
+	b.b = make(map[uint32]*packetAccumulator)
 }
 
 // dumpUnlocked dumps the packet pool by looking for the first item with packets inside
