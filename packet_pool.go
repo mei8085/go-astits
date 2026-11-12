@@ -109,6 +109,19 @@ func (b *packetPool) addUnlocked(p *Packet) (ps []*Packet) {
 	return acc.add(p)
 }
 
+// resetPIDUnlocked discards every packet accumulated for a PID.
+//
+// It is called at an explicit program switch boundary: when the PAT/PMT
+// version changes or a PID is reassigned by a new table, packets buffered for
+// that PID still belong to the previous stream. Dropping them guarantees the
+// next emitted unit starts on a fresh PES payload instead of stitching old
+// fragments onto the new mapping.
+func (b *packetPool) resetPIDUnlocked(pid uint16) {
+	if acc, ok := b.b[uint32(pid)]; ok {
+		acc.q = nil
+	}
+}
+
 // dumpUnlocked dumps the packet pool by looking for the first item with packets inside
 func (b *packetPool) dumpUnlocked() (ps []*Packet) {
 	var keys []int
@@ -134,7 +147,10 @@ func hasDiscontinuity(ps []*Packet, p *Packet) bool {
 
 	isDiscontinuityIndicator := p.Header.HasAdaptationField && p.AdaptationField.DiscontinuityIndicator
 	if isDiscontinuityIndicator {
-		return false
+		// The sender explicitly marks a break (e.g. a program switch or a
+		// resume after interruption): buffered packets belong to the previous
+		// stream and must not be concatenated with what follows.
+		return true
 	}
 
 	l := len(ps)

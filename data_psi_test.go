@@ -13,7 +13,7 @@ var psi = &PSIData{
 	PointerField: 4,
 	Sections: []*PSISection{
 		{
-			CRC32: uint32(0x7ffc6102),
+			CRC32: uint32(0x6322f703),
 			Header: &PSISectionHeader{
 				PrivateBit:             true,
 				SectionLength:          30,
@@ -27,7 +27,7 @@ var psi = &PSIData{
 			},
 		},
 		{
-			CRC32: uint32(0xfebaa941),
+			CRC32: uint32(0xc0c14bfb),
 			Header: &PSISectionHeader{
 				PrivateBit:             true,
 				SectionLength:          25,
@@ -41,7 +41,7 @@ var psi = &PSIData{
 			},
 		},
 		{
-			CRC32: uint32(0x60739f61),
+			CRC32: uint32(0x77532105),
 			Header: &PSISectionHeader{
 				PrivateBit:             true,
 				SectionLength:          17,
@@ -55,7 +55,7 @@ var psi = &PSIData{
 			},
 		},
 		{
-			CRC32: uint32(0xc68442e8),
+			CRC32: uint32(0x99fae11c),
 			Header: &PSISectionHeader{
 				PrivateBit:             true,
 				SectionLength:          24,
@@ -69,7 +69,7 @@ var psi = &PSIData{
 			},
 		},
 		{
-			CRC32: uint32(0xef3751d6),
+			CRC32: uint32(0x32a5c561),
 			Header: &PSISectionHeader{
 				PrivateBit:             true,
 				SectionLength:          20,
@@ -111,7 +111,7 @@ func psiBytes() []byte {
 	w.Write("000000011110")                // EIT section length
 	w.Write(psiSectionSyntaxHeaderBytes()) // EIT syntax section header
 	w.Write(eitBytes())                    // EIT data
-	w.Write(uint32(0x7ffc6102))            // EIT CRC32
+	w.Write(uint32(0x6322f703))            // EIT CRC32
 	w.Write(uint8(64))                     // NIT table ID
 	w.Write("1")                           // NIT syntax section indicator
 	w.Write("1")                           // NIT private bit
@@ -119,7 +119,7 @@ func psiBytes() []byte {
 	w.Write("000000011001")                // NIT section length
 	w.Write(psiSectionSyntaxHeaderBytes()) // NIT syntax section header
 	w.Write(nitBytes())                    // NIT data
-	w.Write(uint32(0xfebaa941))            // NIT CRC32
+	w.Write(uint32(0xc0c14bfb))            // NIT CRC32
 	w.Write(uint8(0))                      // PAT table ID
 	w.Write("1")                           // PAT syntax section indicator
 	w.Write("1")                           // PAT private bit
@@ -127,7 +127,7 @@ func psiBytes() []byte {
 	w.Write("000000010001")                // PAT section length
 	w.Write(psiSectionSyntaxHeaderBytes()) // PAT syntax section header
 	w.Write(patBytes())                    // PAT data
-	w.Write(uint32(0x60739f61))            // PAT CRC32
+	w.Write(uint32(0x77532105))            // PAT CRC32
 	w.Write(uint8(2))                      // PMT table ID
 	w.Write("1")                           // PMT syntax section indicator
 	w.Write("1")                           // PMT private bit
@@ -135,7 +135,7 @@ func psiBytes() []byte {
 	w.Write("000000011000")                // PMT section length
 	w.Write(psiSectionSyntaxHeaderBytes()) // PMT syntax section header
 	w.Write(pmtBytes())                    // PMT data
-	w.Write(uint32(0xc68442e8))            // PMT CRC32
+	w.Write(uint32(0x99fae11c))            // PMT CRC32
 	w.Write(uint8(66))                     // SDT table ID
 	w.Write("1")                           // SDT syntax section indicator
 	w.Write("1")                           // SDT private bit
@@ -143,7 +143,7 @@ func psiBytes() []byte {
 	w.Write("000000010100")                // SDT section length
 	w.Write(psiSectionSyntaxHeaderBytes()) // SDT syntax section header
 	w.Write(sdtBytes())                    // SDT data
-	w.Write(uint32(0xef3751d6))            // SDT CRC32
+	w.Write(uint32(0x32a5c561))            // SDT CRC32
 	w.Write(uint8(115))                    // TOT table ID
 	w.Write("1")                           // TOT syntax section indicator
 	w.Write("1")                           // TOT private bit
@@ -245,8 +245,8 @@ func TestPSITableType(t *testing.T) {
 
 var psiSectionSyntaxHeader = &PSISectionSyntaxHeader{
 	CurrentNextIndicator: true,
-	LastSectionNumber:    3,
-	SectionNumber:        2,
+	LastSectionNumber:    0,
+	SectionNumber:        0,
 	TableIDExtension:     1,
 	VersionNumber:        21,
 }
@@ -258,8 +258,8 @@ func psiSectionSyntaxHeaderBytes() []byte {
 	w.Write("11")      // Reserved bits
 	w.Write("10101")   // Version number
 	w.Write("1")       // Current/next indicator
-	w.Write(uint8(2))  // Section number
-	w.Write(uint8(3))  // Last section number
+	w.Write(uint8(0))  // Section number
+	w.Write(uint8(0))  // Last section number
 	return buf.Bytes()
 }
 
@@ -272,12 +272,12 @@ func TestParsePSISectionSyntaxHeader(t *testing.T) {
 func TestPSIToData(t *testing.T) {
 	p := &Packet{}
 	assert.Equal(t, []*DemuxerData{
-		{EIT: eit, FirstPacket: p, PID: 2},
-		{FirstPacket: p, NIT: nit, PID: 2},
-		{FirstPacket: p, PAT: pat, PID: 2},
-		{FirstPacket: p, PMT: pmt, PID: 2},
-		{FirstPacket: p, SDT: sdt, PID: 2},
-		{FirstPacket: p, TOT: tot, PID: 2},
+		{EIT: eit, FirstPacket: p, PID: 2, psi: psiSectionSyntaxHeader},
+		{FirstPacket: p, NIT: nit, PID: 2, psi: psiSectionSyntaxHeader},
+		{FirstPacket: p, PAT: pat, PID: 2, psi: psiSectionSyntaxHeader},
+		{FirstPacket: p, PMT: pmt, PID: 2, psi: psiSectionSyntaxHeader},
+		{FirstPacket: p, SDT: sdt, PID: 2, psi: psiSectionSyntaxHeader},
+		{FirstPacket: p, TOT: tot, PID: 2}, // TOT sections carry no syntax header
 	}, psi.toData(p, uint16(2)))
 }
 
@@ -300,13 +300,13 @@ var psiDataTestCases = []psiDataTestCase{
 			w.Write("000000010001")                // PAT section length
 			w.Write(psiSectionSyntaxHeaderBytes()) // PAT syntax section header
 			w.Write(patBytes())                    // PAT data
-			w.Write(uint32(0x60739f61))            // PAT CRC32
+			w.Write(uint32(0x77532105))            // PAT CRC32
 		},
 		&PSIData{
 			PointerField: 4,
 			Sections: []*PSISection{
 				{
-					CRC32: uint32(0x60739f61),
+					CRC32: uint32(0x77532105),
 					Header: &PSISectionHeader{
 						PrivateBit:             true,
 						SectionLength:          17,
@@ -334,13 +334,13 @@ var psiDataTestCases = []psiDataTestCase{
 			w.Write("000000011000")                // PMT section length
 			w.Write(psiSectionSyntaxHeaderBytes()) // PMT syntax section header
 			w.Write(pmtBytes())                    // PMT data
-			w.Write(uint32(0xc68442e8))            // PMT CRC32
+			w.Write(uint32(0x99fae11c))            // PMT CRC32
 		},
 		&PSIData{
 			PointerField: 4,
 			Sections: []*PSISection{
 				{
-					CRC32: uint32(0xc68442e8),
+					CRC32: uint32(0x99fae11c),
 					Header: &PSISectionHeader{
 						PrivateBit:             true,
 						SectionLength:          24,

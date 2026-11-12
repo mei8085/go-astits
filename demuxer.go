@@ -36,6 +36,7 @@ type Demuxer struct {
 	programMap   *programMap
 	r            io.Reader
 	streamMap    *elementaryStreamMap
+	tableState   *programTableState
 }
 
 // PacketsParser represents an object capable of parsing a set of packets containing a unique payload spanning over those packets
@@ -57,6 +58,7 @@ func NewDemuxer(ctx context.Context, r io.Reader, opts ...func(*Demuxer)) (d *De
 		streamMap:  newElementaryStreamMap(),
 	}
 	d.packetPool = newPacketPool(d.programMap)
+	d.tableState = newProgramTableState(d.programMap, d.streamMap, d.packetPool)
 
 	// Apply options
 	for _, opt := range opts {
@@ -191,20 +193,16 @@ func (dmx *Demuxer) updateData(ds []*DemuxerData) (d *DemuxerData) {
 		d = ds[0]
 		dmx.dataBuffer = append(dmx.dataBuffer, ds[1:]...)
 
-		// Update program map
+		// Update program configuration at explicit, complete-table switch
+		// boundaries. Retransmitted versions and partially received new tables
+		// leave the active mapping untouched, and PIDs whose meaning changes
+		// have their packet accumulators flushed before any new PES is emitted.
 		for _, v := range ds {
 			if v.PAT != nil {
-				for _, pgm := range v.PAT.Programs {
-					// Program number 0 is reserved to NIT
-					if pgm.ProgramNumber > 0 {
-						dmx.programMap.setUnlocked(pgm.ProgramMapID, pgm.ProgramNumber)
-					}
-				}
+				dmx.tableState.handlePAT(v, v.psi)
 			}
 			if v.PMT != nil {
-				for _, es := range v.PMT.ElementaryStreams {
-					dmx.streamMap.setUnlocked(es.ElementaryPID, v.PMT.ProgramNumber)
-				}
+				dmx.tableState.handlePMT(v, v.psi)
 			}
 		}
 	}
@@ -216,6 +214,16 @@ func (dmx *Demuxer) Rewind() (n int64, err error) {
 	dmx.dataBuffer = []*DemuxerData{}
 	dmx.packetBuffer = nil
 	dmx.packetPool = newPacketPool(dmx.programMap)
+	// The stream is replayed from its beginning, so the table version tracking
+	// must restart as well: otherwise the retransmitted initial PAT/PMT would
+	// be mistaken for duplicates and never populate the maps again.
+	for pid := range dmx.programMap.p {
+		delete(dmx.programMap.p, pid)
+	}
+	for pid := range dmx.streamMap.es {
+		delete(dmx.streamMap.es, pid)
+	}
+	dmx.tableState = newProgramTableState(dmx.programMap, dmx.streamMap, dmx.packetPool)
 	if n, err = rewind(dmx.r); err != nil {
 		err = fmt.Errorf("astits: rewinding reader failed: %w", err)
 		return

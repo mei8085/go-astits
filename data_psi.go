@@ -468,21 +468,28 @@ func (d *PSIData) toData(firstPacket *Packet, pid uint16) (ds []*DemuxerData) {
 			continue
 		}
 
+		// Keep the section syntax header so the demuxer can track table
+		// versions and assemble multi-section tables atomically.
+		var syntaxHeader *PSISectionSyntaxHeader
+		if s.Syntax != nil {
+			syntaxHeader = s.Syntax.Header
+		}
+
 		// Switch on table type
 		switch s.Header.TableID {
 		case PSITableIDNITVariant1, PSITableIDNITVariant2:
-			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, NIT: s.Syntax.Data.NIT, PID: pid})
+			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, NIT: s.Syntax.Data.NIT, PID: pid, psi: syntaxHeader})
 		case PSITableIDPAT:
-			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PAT: s.Syntax.Data.PAT, PID: pid})
+			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PAT: s.Syntax.Data.PAT, PID: pid, psi: syntaxHeader})
 		case PSITableIDPMT:
-			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, PMT: s.Syntax.Data.PMT})
+			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, PMT: s.Syntax.Data.PMT, psi: syntaxHeader})
 		case PSITableIDSDTVariant1, PSITableIDSDTVariant2:
-			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, SDT: s.Syntax.Data.SDT})
+			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, SDT: s.Syntax.Data.SDT, psi: syntaxHeader})
 		case PSITableIDTOT:
-			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, TOT: s.Syntax.Data.TOT})
+			ds = append(ds, &DemuxerData{FirstPacket: firstPacket, PID: pid, TOT: s.Syntax.Data.TOT, psi: syntaxHeader})
 		}
 		if s.Header.TableID >= PSITableIDEITStart && s.Header.TableID <= PSITableIDEITEnd {
-			ds = append(ds, &DemuxerData{EIT: s.Syntax.Data.EIT, FirstPacket: firstPacket, PID: pid})
+			ds = append(ds, &DemuxerData{EIT: s.Syntax.Data.EIT, FirstPacket: firstPacket, PID: pid, psi: syntaxHeader})
 		}
 	}
 	return

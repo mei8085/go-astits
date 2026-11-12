@@ -25,6 +25,11 @@ type DemuxerData struct {
 	PMT         *PMTData
 	SDT         *SDTData
 	TOT         *TOTData
+
+	// psi carries the section syntax header when this data was parsed from a
+	// PSI section. It is used internally to keep PAT/PMT versions consistent
+	// across section retransmissions and multi-section table updates.
+	psi *PSISectionSyntaxHeader
 }
 
 // MuxerData represents a data to be written by Muxer

@@ -4,12 +4,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHasDiscontinuity(t *testing.T) {
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 0, HasPayload: true}}))
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 15}}))
-	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{AdaptationField: &PacketAdaptationField{DiscontinuityIndicator: true}, Header: PacketHeader{ContinuityCounter: 0, HasAdaptationField: true, HasPayload: true}}))
+	// An explicit discontinuity_indicator always starts a fresh payload, even
+	// when the continuity counter happens to match the expected value.
+	assert.True(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{AdaptationField: &PacketAdaptationField{DiscontinuityIndicator: true}, Header: PacketHeader{ContinuityCounter: 0, HasAdaptationField: true, HasPayload: true}}))
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{PID: PIDNull}}))
 	assert.False(t, hasDiscontinuity([]*Packet{}, &Packet{Header: PacketHeader{ContinuityCounter: 5}}))
 	assert.True(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 1, HasPayload: true}}))
@@ -139,4 +142,30 @@ func TestPacketPoolBoundedPESCompletesWithoutNextStart(t *testing.T) {
 	assert.Empty(t, b.addUnlocked(packets[1]))
 	assert.Equal(t, packets, b.addUnlocked(packets[2]))
 	assert.Empty(t, b.dumpUnlocked())
+}
+
+// A packet with the discontinuity_indicator set must break the accumulation:
+// the previous fragment is discarded and the new payload starts a fresh unit
+// instead of being concatenated with the pre-interruption stream.
+func TestPacketPoolDiscontinuityIndicatorFlushesQueue(t *testing.T) {
+	pool := newPacketPool(nil)
+	pid := uint16(0x0300)
+
+	// First packet starts a PES but does not complete it.
+	pool.addUnlocked(&Packet{Header: PacketHeader{PID: pid, ContinuityCounter: 0, HasPayload: true, PayloadUnitStartIndicator: true}, Payload: []byte{0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0, 0xaa}})
+	require.NotEmpty(t, pool.b[uint32(pid)].q)
+
+	// Next packet explicitly signals a discontinuity and starts a new PES.
+	ps := pool.addUnlocked(&Packet{
+		AdaptationField: &PacketAdaptationField{DiscontinuityIndicator: true},
+		Header:          PacketHeader{PID: pid, ContinuityCounter: 1, HasAdaptationField: true, HasPayload: true, PayloadUnitStartIndicator: true},
+		Payload:         []byte{0, 0, 1, 0xc0, 0, 0, 0x80, 0, 0, 0xbb},
+	})
+
+	// The old fragment must not be returned together with the new payload.
+	for _, p := range ps {
+		assert.NotEqual(t, byte(0xaa), p.Payload[len(p.Payload)-1])
+	}
+	assert.Len(t, pool.b[uint32(pid)].q, 1)
+	assert.Equal(t, byte(0xc0), pool.b[uint32(pid)].q[0].Payload[3])
 }
