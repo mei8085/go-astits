@@ -16,6 +16,14 @@ func (c *wrappingCounter) get() int {
 	return c.value
 }
 
+func (c *wrappingCounter) next() int {
+	value := c.value + 1
+	if value > c.wrapAt {
+		return 0
+	}
+	return value
+}
+
 func (c *wrappingCounter) inc() int {
 	c.value++
 	if c.value > c.wrapAt {

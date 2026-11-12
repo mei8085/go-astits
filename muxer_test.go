@@ -3,11 +3,97 @@ package astits
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"testing"
 
 	"github.com/asticode/go-astikit"
 	"github.com/stretchr/testify/assert"
 )
+
+type scriptedWriter struct {
+	buf        bytes.Buffer
+	limit      *int
+	errs       []error
+	defaultErr error
+	call       int
+	writeCalls int
+}
+
+type errorThenSuccessWriter struct {
+	bytes.Buffer
+	err error
+}
+
+func (w *errorThenSuccessWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		err := w.err
+		w.err = nil
+		return 0, err
+	}
+	return w.Buffer.Write(p)
+}
+
+func (w *scriptedWriter) setLimit(limit int) {
+	w.limit = &limit
+}
+
+func (w *scriptedWriter) clearLimit() {
+	w.limit = nil
+}
+
+func (w *scriptedWriter) Write(p []byte) (int, error) {
+	i := w.call
+	w.call++
+	w.writeCalls++
+
+	n := len(p)
+	if w.limit != nil && *w.limit < n {
+		n = *w.limit
+	}
+	w.buf.Write(p[:n])
+
+	var err error
+	if i < len(w.errs) {
+		err = w.errs[i]
+	} else {
+		err = w.defaultErr
+	}
+	return n, err
+}
+
+func newTestMuxerWithStream(w io.Writer) *Muxer {
+	muxer := NewMuxer(context.Background(), w)
+	err := muxer.AddElementaryStream(PMTElementaryStream{
+		ElementaryPID: 0x1234,
+		StreamType:    StreamTypeH264Video,
+	})
+	if err != nil {
+		panic(err)
+	}
+	muxer.SetPCRPID(0x1234)
+	return muxer
+}
+
+func newTestMuxerData(payload []byte) *MuxerData {
+	return &MuxerData{
+		PID: 0x1234,
+		AdaptationField: &PacketAdaptationField{
+			HasPCR:                true,
+			PCR:                   &ClockReference{Base: 42, Extension: 7},
+			RandomAccessIndicator: true,
+		},
+		PES: &PESData{
+			Data: payload,
+			Header: &PESHeader{
+				OptionalHeader: &PESOptionalHeader{
+					PTS:             &ClockReference{Base: 41},
+					PTSDTSIndicator: PTSDTSIndicatorOnlyPTS,
+				},
+			},
+		},
+	}
+}
 
 func patExpectedBytes(versionNumber uint8, cc uint8) []byte {
 	buf := bytes.Buffer{}
@@ -333,4 +419,149 @@ func TestMuxer_WritePayload(t *testing.T) {
 	bs := buf.Bytes()
 	assert.Equal(t, patExpectedBytes(0, 0), bs[:MpegTsPacketSize])
 	assert.Equal(t, pmtExpectedBytesVideoAndAudio(0, 0), bs[MpegTsPacketSize:MpegTsPacketSize*2])
+}
+
+func TestMuxer_WriteTablesShortWriteRetry(t *testing.T) {
+	writer := &scriptedWriter{}
+	writer.setLimit(100)
+	muxer := newTestMuxerWithStream(writer)
+
+	n, err := muxer.WriteTables()
+	assert.Equal(t, io.ErrShortWrite, err)
+	assert.Equal(t, 100, n)
+	assert.True(t, muxer.pendingTables)
+
+	writer.clearLimit()
+	n, err = muxer.WriteTables()
+	assert.NoError(t, err)
+	assert.Equal(t, 2*MpegTsPacketSize-100, n)
+	assert.False(t, muxer.pendingTables)
+	assert.Nil(t, muxer.pendingPacket)
+	assert.Equal(t, 0, muxer.patCC.value)
+	assert.Equal(t, 0, muxer.pmtCC.value)
+	assert.Equal(t, 0, muxer.patVersion.value)
+	assert.Equal(t, 0, muxer.pmtVersion.value)
+
+	expected := append(patExpectedBytes(0, 0), pmtExpectedBytesVideoOnly(0, 0)...)
+	assert.Equal(t, expected, writer.buf.Bytes())
+}
+
+func TestMuxer_WriteDataShortWriteRetry(t *testing.T) {
+	writer := &scriptedWriter{}
+	writer.setLimit(100)
+	muxer := newTestMuxerWithStream(writer)
+	data := newTestMuxerData(testPayload())
+	ctx := muxer.esContexts[0x1234]
+
+	n, err := muxer.WriteData(data)
+	assert.Equal(t, io.ErrShortWrite, err)
+	assert.Equal(t, 100, n)
+	assert.NotNil(t, muxer.pendingPacket)
+
+	writer.clearLimit()
+	n, err = muxer.WriteData(data)
+	assert.NoError(t, err)
+	assert.Greater(t, n, 0)
+	assert.Nil(t, muxer.pendingPacket)
+
+	expectedWriter := bytes.Buffer{}
+	expectedMuxer := newTestMuxerWithStream(&expectedWriter)
+	_, err = expectedMuxer.WriteData(newTestMuxerData(testPayload()))
+	assert.NoError(t, err)
+	assert.Equal(t, expectedMuxer.esContexts[0x1234].cc.value, ctx.cc.value)
+	assert.Len(t, writer.buf.Bytes(), 3*MpegTsPacketSize)
+}
+
+func TestMuxer_WriteDataDoesNotAdvanceTableVersionBeforeCommit(t *testing.T) {
+	writer := &scriptedWriter{}
+	writer.setLimit(10)
+	muxer := newTestMuxerWithStream(writer)
+	err := muxer.AddElementaryStream(PMTElementaryStream{
+		ElementaryPID: 0x0234,
+		StreamType:    StreamTypeAACAudio,
+	})
+	assert.NoError(t, err)
+	initialVersion := muxer.pmtVersion.value
+
+	data := newTestMuxerData([]byte{1, 2, 3})
+	n, err := muxer.WriteData(data)
+	assert.Equal(t, io.ErrShortWrite, err)
+	assert.Equal(t, 10, n)
+	assert.True(t, muxer.pmtUpdated)
+	assert.Equal(t, initialVersion, muxer.pmtVersion.value)
+
+	writer.clearLimit()
+	n, err = muxer.WriteData(data)
+	assert.NoError(t, err)
+	assert.Greater(t, n, 0)
+	assert.GreaterOrEqual(t, muxer.pmtVersion.value, initialVersion)
+}
+
+func TestMuxer_WriteDataRejectsNewInputWhileOperationIsPending(t *testing.T) {
+	writer := &scriptedWriter{}
+	writer.setLimit(10)
+	muxer := newTestMuxerWithStream(writer)
+	data := newTestMuxerData([]byte{1, 2, 3})
+
+	_, err := muxer.WriteData(data)
+	assert.Equal(t, io.ErrShortWrite, err)
+
+	other := newTestMuxerData([]byte{4, 5, 6})
+	n, err := muxer.WriteData(other)
+	assert.Equal(t, ErrWriteInProgress, err)
+	assert.Equal(t, 0, n)
+
+	writer.clearLimit()
+	n, err = muxer.WriteData(data)
+	assert.NoError(t, err)
+	assert.Greater(t, n, 0)
+}
+
+func TestMuxer_WritePacketShortWriteRetry(t *testing.T) {
+	writer := &scriptedWriter{}
+	writer.setLimit(7)
+	muxer := NewMuxer(context.Background(), writer)
+	packet := &Packet{
+		Header: PacketHeader{
+			HasPayload: true,
+			PID:        0x1234,
+		},
+		Payload: bytes.Repeat([]byte{0x42}, 100),
+	}
+
+	n, err := muxer.WritePacket(packet)
+	assert.Equal(t, io.ErrShortWrite, err)
+	assert.Equal(t, 7, n)
+
+	writer.clearLimit()
+	n, err = muxer.WritePacket(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, MpegTsPacketSize-7, n)
+
+	var expected bytes.Buffer
+	expectedMuxer := NewMuxer(context.Background(), &expected)
+	_, err = expectedMuxer.WritePacket(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, expected.Bytes(), writer.buf.Bytes())
+}
+
+func TestMuxer_WritePacketRetriesWriterErrorWithoutDuplicatingPacket(t *testing.T) {
+	writeErr := errors.New("temporary write failure")
+	writer := &errorThenSuccessWriter{err: writeErr}
+	muxer := NewMuxer(context.Background(), writer)
+	packet := &Packet{Header: PacketHeader{PID: 0x1234}}
+
+	n, err := muxer.WritePacket(packet)
+	assert.Equal(t, writeErr, err)
+	assert.Equal(t, 0, n)
+
+	n, err = muxer.WritePacket(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, MpegTsPacketSize, n)
+
+	var expected bytes.Buffer
+	expectedMuxer := NewMuxer(context.Background(), &expected)
+	_, err = expectedMuxer.WritePacket(packet)
+	assert.NoError(t, err)
+	assert.Equal(t, expected.Bytes(), writer.Buffer.Bytes())
 }

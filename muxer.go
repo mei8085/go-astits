@@ -19,12 +19,12 @@ var (
 	ErrPIDNotFound      = errors.New("astits: PID not found")
 	ErrPIDAlreadyExists = errors.New("astits: PID already exists")
 	ErrPCRPIDInvalid    = errors.New("astits: PCR PID invalid")
+	ErrWriteInProgress  = errors.New("astits: write in progress")
 )
 
 type Muxer struct {
-	ctx        context.Context
-	w          io.Writer
-	bitsWriter *astikit.BitsWriter
+	ctx context.Context
+	w   io.Writer
 
 	packetSize             int
 	tablesRetransmitPeriod int // period in PES packets
@@ -48,9 +48,24 @@ type Muxer struct {
 	buf       bytes.Buffer
 	bufWriter *astikit.BitsWriter
 
+	pendingPacket    []byte
+	pendingCommit    func()
+	pendingTables    bool
+	pendingPMT       bool
+	delayCommit      bool
+	pendingWriteData *muxerWriteDataState
+
 	// We use map[uint32] instead map[uint16] as go runtime provide optimized hash functions for (u)int32/64 keys
 	esContexts              map[uint32]*esContext
 	tablesRetransmitCounter int
+}
+
+type muxerWriteDataState struct {
+	d                    *MuxerData
+	ctx                  *esContext
+	payloadStart         bool
+	writeAdaptationField bool
+	payloadBytesWritten  int
 }
 
 type esContext struct {
@@ -116,7 +131,6 @@ func NewMuxer(ctx context.Context, w io.Writer, opts ...func(*Muxer)) *Muxer {
 	}
 
 	m.bufWriter = astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.buf})
-	m.bitsWriter = astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: m.w})
 
 	for _, opt := range opts {
 		opt(m)
@@ -190,42 +204,83 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
 	}
 
 	bytesWritten := 0
+	if m.pendingWriteData != nil && m.pendingWriteData.d != d {
+		return 0, ErrWriteInProgress
+	}
+
+	if m.pendingPacket != nil {
+		n, err := m.flushPendingPacket()
+		bytesWritten += n
+		if m.pendingPacket != nil {
+			return bytesWritten, err
+		}
+
+		if m.pendingWriteData != nil {
+			return m.continueWriteData(bytesWritten)
+		}
+
+		if m.pendingTables {
+			return m.writePendingTablePacket(bytesWritten)
+		}
+	}
 
 	forceTables := d.AdaptationField != nil &&
 		d.AdaptationField.RandomAccessIndicator &&
 		d.PID == m.pmt.PCRPID
 
 	n, err := m.retransmitTables(forceTables)
+	bytesWritten += n
 	if err != nil {
-		return n, err
+		if m.pendingPacket != nil {
+			m.pendingWriteData = &muxerWriteDataState{
+				d:                    d,
+				ctx:                  ctx,
+				payloadStart:         true,
+				writeAdaptationField: d.AdaptationField != nil,
+			}
+		}
+		return bytesWritten, err
 	}
 
-	bytesWritten += n
+	return m.startWriteData(bytesWritten, d, ctx)
+}
 
-	payloadStart := true
-	writeAf := d.AdaptationField != nil
-	payloadBytesWritten := 0
-	for payloadBytesWritten < len(d.PES.Data) {
+func (m *Muxer) startWriteData(bytesWritten int, d *MuxerData, ctx *esContext) (int, error) {
+	m.pendingWriteData = &muxerWriteDataState{
+		d:                    d,
+		ctx:                  ctx,
+		payloadStart:         true,
+		writeAdaptationField: d.AdaptationField != nil,
+	}
+	return m.continueWriteData(bytesWritten)
+}
+
+func (m *Muxer) continueWriteData(bytesWritten int) (int, error) {
+	state := m.pendingWriteData
+	d := state.d
+	ctx := state.ctx
+
+	for state.payloadBytesWritten < len(d.PES.Data) {
 		pktLen := 1 + mpegTsPacketHeaderSize // sync byte + header
 		pkt := Packet{
 			Header: PacketHeader{
-				ContinuityCounter:         uint8(ctx.cc.inc()),
-				HasAdaptationField:        writeAf,
+				ContinuityCounter:         uint8(ctx.cc.next()),
+				HasAdaptationField:        state.writeAdaptationField,
 				HasPayload:                false,
 				PayloadUnitStartIndicator: false,
 				PID:                       d.PID,
 			},
 		}
 
-		if writeAf {
-			pkt.AdaptationField = d.AdaptationField
+		if state.writeAdaptationField {
+			af := *d.AdaptationField
+			pkt.AdaptationField = &af
 			// one byte for adaptation field length field
-			pktLen += 1 + int(calcPacketAdaptationFieldLength(d.AdaptationField))
-			writeAf = false
+			pktLen += 1 + int(calcPacketAdaptationFieldLength(pkt.AdaptationField))
 		}
 
 		bytesAvailable := m.packetSize - pktLen
-		if payloadStart {
+		if state.payloadStart {
 			pesHeaderLengthCurrent := pesHeaderLength + int(calcPESOptionalHeaderLength(d.PES.Header.OptionalHeader))
 			// d.AdaptationField with pes header are too big, we don't have space to write pes header
 			if bytesAvailable < pesHeaderLengthCurrent {
@@ -245,24 +300,27 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
 
 		if pkt.Header.HasPayload {
 			m.buf.Reset()
-			if d.PES.Header.StreamID == 0 {
+			streamIDWasZero := d.PES.Header.StreamID == 0
+			if streamIDWasZero {
 				d.PES.Header.StreamID = ctx.es.StreamType.ToPESStreamID()
 			}
 
 			ntot, npayload, err := writePESData(
 				m.bufWriter,
 				d.PES.Header,
-				d.PES.Data[payloadBytesWritten:],
-				payloadStart,
+				d.PES.Data[state.payloadBytesWritten:],
+				state.payloadStart,
 				bytesAvailable,
 			)
+			if streamIDWasZero {
+				d.PES.Header.StreamID = 0
+			}
 			if err != nil {
 				return bytesWritten, err
 			}
 
-			payloadBytesWritten += npayload
-
-			pkt.Payload = m.buf.Bytes()
+			payload := append([]byte(nil), m.buf.Bytes()...)
+			pkt.Payload = payload
 
 			bytesAvailable -= ntot
 			// if we still have some space in packet, we should stuff it with adaptation field stuffing
@@ -276,20 +334,44 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
 				}
 			}
 
-			n, err = writePacket(m.bitsWriter, &pkt, m.packetSize)
-			if err != nil {
+			packetBytes := bytes.Buffer{}
+			packetWriter := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &packetBytes})
+			if _, err = writePacket(packetWriter, &pkt, m.packetSize); err != nil {
 				return bytesWritten, err
 			}
 
+			n, err := m.writePacket(packetBytes.Bytes(), func() {
+				ctx.cc.inc()
+				state.payloadBytesWritten += npayload
+				state.payloadStart = false
+				state.writeAdaptationField = false
+			})
 			bytesWritten += n
+			if err != nil {
+				return bytesWritten, err
+			}
+		} else {
+			packetBytes := bytes.Buffer{}
+			packetWriter := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &packetBytes})
+			if _, err := writePacket(packetWriter, &pkt, m.packetSize); err != nil {
+				return bytesWritten, err
+			}
 
-			payloadStart = false
+			n, err := m.writePacket(packetBytes.Bytes(), func() {
+				ctx.cc.inc()
+				state.writeAdaptationField = false
+			})
+			bytesWritten += n
+			if err != nil {
+				return bytesWritten, err
+			}
 		}
 	}
 
 	if d.AdaptationField != nil {
 		d.AdaptationField.StuffingLength = 0
 	}
+	m.pendingWriteData = nil
 
 	return bytesWritten, nil
 }
@@ -297,7 +379,86 @@ func (m *Muxer) WriteData(d *MuxerData) (int, error) {
 // Writes given packet to MPEG-TS stream
 // Stuffs with 0xffs if packet turns out to be shorter than target packet length
 func (m *Muxer) WritePacket(p *Packet) (int, error) {
-	return writePacket(m.bitsWriter, p, m.packetSize)
+	if m.pendingWriteData != nil || m.pendingTables {
+		return 0, ErrWriteInProgress
+	}
+
+	if m.pendingPacket != nil {
+		n, err := m.flushPendingPacket()
+		if err != nil || m.pendingPacket != nil {
+			return n, firstError(err, ErrWriteInProgress)
+		}
+		return n, err
+	}
+
+	packetBytes := bytes.Buffer{}
+	packetWriter := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &packetBytes})
+	if _, err := writePacket(packetWriter, p, m.packetSize); err != nil {
+		return 0, err
+	}
+
+	return m.writePacket(packetBytes.Bytes(), nil)
+}
+
+func firstError(err error, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
+}
+
+func (m *Muxer) writePacket(packet []byte, commit func()) (int, error) {
+	n, err := m.w.Write(packet)
+	if err != nil {
+		return n, err
+	}
+	if n < 0 || n > len(packet) {
+		return n, io.ErrShortWrite
+	}
+	if n < len(packet) {
+		m.pendingPacket = append([]byte(nil), packet[n:]...)
+		m.pendingCommit = commit
+		m.delayCommit = m.pendingTables
+		return n, io.ErrShortWrite
+	}
+
+	if commit != nil {
+		commit()
+	}
+	return n, nil
+}
+
+func (m *Muxer) flushPendingPacket() (int, error) {
+	remaining := m.pendingPacket
+	n, err := m.w.Write(remaining)
+	if err != nil {
+		return n, err
+	}
+	if n < 0 || n > len(remaining) {
+		return n, io.ErrShortWrite
+	}
+
+	bytesWritten := n
+	if n < len(remaining) {
+		m.pendingPacket = append([]byte(nil), remaining[n:]...)
+		m.delayCommit = m.pendingTables
+		return bytesWritten, io.ErrShortWrite
+	}
+
+	commit := m.pendingCommit
+	delayed := m.delayCommit
+	m.pendingPacket = nil
+	m.pendingCommit = nil
+	m.delayCommit = false
+	if commit != nil {
+		if delayed && n < len(remaining) {
+			m.pendingCommit = commit
+		} else {
+			commit()
+		}
+	}
+
+	return bytesWritten, nil
 }
 
 func (m *Muxer) retransmitTables(force bool) (int, error) {
@@ -306,7 +467,7 @@ func (m *Muxer) retransmitTables(force bool) (int, error) {
 		return 0, nil
 	}
 
-	n, err := m.WriteTables()
+	n, err := m.writeTablesInternal()
 	if err != nil {
 		return n, err
 	}
@@ -316,38 +477,110 @@ func (m *Muxer) retransmitTables(force bool) (int, error) {
 }
 
 func (m *Muxer) WriteTables() (int, error) {
+	if m.pendingPacket != nil {
+		if m.pendingTables {
+			return m.finishPendingTablesPacket(0)
+		}
+		bytesWritten, err := m.flushPendingPacket()
+		if m.pendingPacket != nil {
+			return bytesWritten, firstError(err, ErrWriteInProgress)
+		}
+	}
+	if m.pendingWriteData != nil {
+		return 0, ErrWriteInProgress
+	}
+	if m.pendingTables {
+		return m.writePendingTablePacket(0)
+	}
+
+	return m.writeTablesInternal()
+}
+
+func (m *Muxer) writeTablesInternal() (int, error) {
 	bytesWritten := 0
-
-	if err := m.generatePAT(); err != nil {
-		return bytesWritten, err
+	if m.pendingTables {
+		return m.writePendingTablePacket(0)
 	}
 
-	if err := m.generatePMT(); err != nil {
-		return bytesWritten, err
+	patPacket, patCommit, err := m.buildPAT()
+	if err != nil {
+		return 0, err
 	}
 
-	n, err := m.w.Write(m.patBytes.Bytes())
+	pmtPacket, pmtCommit, err := m.buildPMT()
+	if err != nil {
+		return 0, err
+	}
+
+	m.pendingTables = true
+	m.pendingPMT = true
+	m.delayCommit = false
+	n, err := m.writePacket(patPacket, patCommit)
+	bytesWritten += n
 	if err != nil {
 		return bytesWritten, err
 	}
-	bytesWritten += n
 
-	n, err = m.w.Write(m.pmtBytes.Bytes())
+	n, err = m.writePacket(pmtPacket, pmtCommit)
+	bytesWritten += n
 	if err != nil {
 		return bytesWritten, err
 	}
-	bytesWritten += n
 
+	m.pendingTables = false
+	m.pendingPMT = false
 	return bytesWritten, nil
 }
 
-func (m *Muxer) generatePAT() error {
+func (m *Muxer) writePendingTablePacket(bytesWritten int) (int, error) {
+	if m.pendingPacket != nil {
+		return m.finishPendingTablesPacket(bytesWritten)
+	}
+
+	return m.writeNextPendingTablePacket(bytesWritten)
+}
+
+func (m *Muxer) finishPendingTablesPacket(bytesWritten int) (int, error) {
+	n, err := m.flushPendingPacket()
+	bytesWritten += n
+	if err != nil {
+		return bytesWritten, err
+	}
+	if m.pendingPacket != nil {
+		return bytesWritten, nil
+	}
+
+	return m.writeNextPendingTablePacket(bytesWritten)
+}
+
+func (m *Muxer) writeNextPendingTablePacket(bytesWritten int) (int, error) {
+	if m.pendingPMT {
+		pmtPacket, pmtCommit, err := m.buildPMT()
+		if err != nil {
+			return bytesWritten, err
+		}
+
+		m.pendingPMT = false
+		n, err := m.writePacket(pmtPacket, pmtCommit)
+		bytesWritten += n
+		if err != nil {
+			m.pendingPMT = true
+			return bytesWritten, err
+		}
+	}
+
+	m.pendingTables = false
+	m.pendingPMT = false
+	return bytesWritten, nil
+}
+
+func (m *Muxer) buildPAT() ([]byte, func(), error) {
 	d := m.pm.toPATDataUnlocked()
 	d.TransportStreamID = m.transportStreamID
 
 	versionNumber := m.patVersion.get()
 	if m.pmUpdated {
-		versionNumber = m.patVersion.inc()
+		versionNumber = m.patVersion.next()
 	}
 
 	syntax := &PSISectionSyntax{
@@ -373,35 +606,54 @@ func (m *Muxer) generatePAT() error {
 		Sections: []*PSISection{&section},
 	}
 
-	m.buf.Reset()
-	w := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.buf})
+	sectionBytes := bytes.Buffer{}
+	w := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &sectionBytes})
 	if _, err := writePSIData(w, &psiData); err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	m.patBytes.Reset()
-	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.patBytes})
+	packetBytes := bytes.Buffer{}
+	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &packetBytes})
 
 	pkt := Packet{
 		Header: PacketHeader{
 			HasPayload:                true,
 			PayloadUnitStartIndicator: true,
 			PID:                       PIDPAT,
-			ContinuityCounter:         uint8(m.patCC.inc()),
+			ContinuityCounter:         uint8(m.patCC.next()),
 		},
-		Payload: m.buf.Bytes(),
+		Payload: sectionBytes.Bytes(),
 	}
 	if _, err := writePacket(wPacket, &pkt, m.packetSize); err != nil {
-		// FIXME save old PAT and rollback to it here maybe?
-		return err
+		return nil, nil, err
 	}
 
-	m.pmUpdated = false
+	updated := m.pmUpdated
+	commit := func() {
+		if updated {
+			m.patVersion.inc()
+		}
+		m.patCC.inc()
+		m.pmUpdated = false
+	}
 
+	return packetBytes.Bytes(), commit, nil
+}
+
+func (m *Muxer) generatePAT() error {
+	packet, commit, err := m.buildPAT()
+	if err != nil {
+		return err
+	}
+	m.patBytes.Reset()
+	if _, err = m.patBytes.Write(packet); err != nil {
+		return err
+	}
+	commit()
 	return nil
 }
 
-func (m *Muxer) generatePMT() error {
+func (m *Muxer) buildPMT() ([]byte, func(), error) {
 	hasPCRPID := false
 	for _, es := range m.pmt.ElementaryStreams {
 		if es.ElementaryPID == m.pmt.PCRPID {
@@ -410,12 +662,12 @@ func (m *Muxer) generatePMT() error {
 		}
 	}
 	if !hasPCRPID {
-		return ErrPCRPIDInvalid
+		return nil, nil, ErrPCRPIDInvalid
 	}
 
 	versionNumber := m.pmtVersion.get()
 	if m.pmtUpdated {
-		versionNumber = m.pmtVersion.inc()
+		versionNumber = m.pmtVersion.next()
 	}
 
 	syntax := &PSISectionSyntax{
@@ -441,30 +693,49 @@ func (m *Muxer) generatePMT() error {
 		Sections: []*PSISection{&section},
 	}
 
-	m.buf.Reset()
-	w := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.buf})
+	sectionBytes := bytes.Buffer{}
+	w := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &sectionBytes})
 	if _, err := writePSIData(w, &psiData); err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	m.pmtBytes.Reset()
-	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &m.pmtBytes})
+	packetBytes := bytes.Buffer{}
+	wPacket := astikit.NewBitsWriter(astikit.BitsWriterOptions{Writer: &packetBytes})
 
 	pkt := Packet{
 		Header: PacketHeader{
 			HasPayload:                true,
 			PayloadUnitStartIndicator: true,
 			PID:                       m.pmtPID, // FIXME multiple programs support
-			ContinuityCounter:         uint8(m.pmtCC.inc()),
+			ContinuityCounter:         uint8(m.pmtCC.next()),
 		},
-		Payload: m.buf.Bytes(),
+		Payload: sectionBytes.Bytes(),
 	}
 	if _, err := writePacket(wPacket, &pkt, m.packetSize); err != nil {
-		// FIXME save old PMT and rollback to it here maybe?
-		return err
+		return nil, nil, err
 	}
 
-	m.pmtUpdated = false
+	updated := m.pmtUpdated
+	commit := func() {
+		if updated {
+			m.pmtVersion.inc()
+		}
+		m.pmtCC.inc()
+		m.pmtUpdated = false
+	}
 
+	return packetBytes.Bytes(), commit, nil
+}
+
+func (m *Muxer) generatePMT() error {
+	packet, commit, err := m.buildPMT()
+	if err != nil {
+		return err
+	}
+	m.pmtBytes.Reset()
+	if _, err = m.pmtBytes.Write(packet); err != nil {
+		return err
+	}
+	commit()
 	return nil
 }
