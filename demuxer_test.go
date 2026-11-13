@@ -32,10 +32,22 @@ func TestDemuxerNew(t *testing.T) {
 	ps := 1
 	pp := func(ps []*Packet) (ds []*DemuxerData, skip bool, err error) { return }
 	sp := func(p *Packet) bool { return true }
-	dmx := NewDemuxer(context.Background(), nil, DemuxerOptPacketSize(ps), DemuxerOptPacketsParser(pp), DemuxerOptPacketSkipper(sp))
+	dmx := NewDemuxer(
+		context.Background(),
+		nil,
+		DemuxerOptPacketSize(ps),
+		DemuxerOptPacketsParser(pp),
+		DemuxerOptPacketSkipper(sp),
+		DemuxerOptPacketPoolHighWaterMark(123),
+		DemuxerOptPacketPoolInactivityLimit(45),
+	)
 	assert.Equal(t, ps, dmx.optPacketSize)
 	assert.Equal(t, fmt.Sprintf("%p", pp), fmt.Sprintf("%p", dmx.optPacketsParser))
 	assert.Equal(t, fmt.Sprintf("%p", sp), fmt.Sprintf("%p", dmx.optPacketSkipper))
+	assert.Equal(t, 123, dmx.optPoolHighWater)
+	assert.Equal(t, 45, dmx.optPoolInactive)
+	assert.Equal(t, 123, dmx.packetPool.reclaimWaterMark)
+	assert.Equal(t, 45, dmx.packetPool.inactivityLimit)
 }
 
 func TestDemuxerNextPacket(t *testing.T) {
@@ -173,6 +185,52 @@ func TestDemuxerRewind(t *testing.T) {
 	assert.Equal(t, 0, len(dmx.dataBuffer))
 	assert.Equal(t, 0, len(dmx.packetPool.b))
 	assert.Nil(t, dmx.packetBuffer)
+	stats := dmx.PacketPoolStats()
+	assert.Zero(t, stats.BufferedBytes)
+	assert.Zero(t, stats.BufferedPackets)
+	assert.Zero(t, stats.DroppedPayloads)
+	assert.Empty(t, stats.DroppedPayloadsByReason)
+	assert.Equal(t, DefaultPacketPoolInactivityLimit, stats.InactivityLimit)
+	assert.Equal(t, DefaultPacketPoolHighWaterMark, stats.ReclaimHighWaterMark)
+}
+
+func TestDemuxerDropsIncompletePESOnStreamSwitch(t *testing.T) {
+	dmx := NewDemuxer(context.Background(), nil)
+	dmx.packetPool.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 256, ContinuityCounter: 0, HasPayload: true, PayloadUnitStartIndicator: true},
+		Payload: []byte{0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0},
+	})
+	dmx.packetPool.addUnlocked(&Packet{
+		Header:  PacketHeader{PID: 256, ContinuityCounter: 1, HasPayload: true},
+		Payload: []byte{1},
+	})
+
+	first := &DemuxerData{
+		PMT: &PMTData{
+			ProgramNumber: 1,
+			ElementaryStreams: []*PMTElementaryStream{
+				{ElementaryPID: 256},
+			},
+		},
+	}
+	next := &DemuxerData{
+		PMT: &PMTData{
+			ProgramNumber: 1,
+			ElementaryStreams: []*PMTElementaryStream{
+				{ElementaryPID: 257},
+			},
+		},
+	}
+
+	dmx.updateData([]*DemuxerData{first})
+	dmx.updateData([]*DemuxerData{next})
+
+	stats := dmx.PacketPoolStats()
+	assert.Equal(t, 1, stats.DroppedPayloadsByReason[PacketPoolDropReasonStreamSwitch])
+	assert.Equal(t, 2, stats.DroppedPackets)
+	assert.Zero(t, stats.BufferedPackets)
+	assert.False(t, dmx.streamMap.existsUnlocked(256))
+	assert.True(t, dmx.streamMap.existsUnlocked(257))
 }
 
 func BenchmarkDemuxer_NextData(b *testing.B) {

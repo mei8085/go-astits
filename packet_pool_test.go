@@ -9,7 +9,7 @@ import (
 func TestHasDiscontinuity(t *testing.T) {
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 0, HasPayload: true}}))
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 15}}))
-	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{AdaptationField: &PacketAdaptationField{DiscontinuityIndicator: true}, Header: PacketHeader{ContinuityCounter: 0, HasAdaptationField: true, HasPayload: true}}))
+	assert.True(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{AdaptationField: &PacketAdaptationField{DiscontinuityIndicator: true}, Header: PacketHeader{ContinuityCounter: 0, HasAdaptationField: true, HasPayload: true}}))
 	assert.False(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{PID: PIDNull}}))
 	assert.False(t, hasDiscontinuity([]*Packet{}, &Packet{Header: PacketHeader{ContinuityCounter: 5}}))
 	assert.True(t, hasDiscontinuity([]*Packet{{Header: PacketHeader{ContinuityCounter: 15}}}, &Packet{Header: PacketHeader{ContinuityCounter: 1, HasPayload: true}}))
@@ -34,20 +34,21 @@ func TestPacketPool(t *testing.T) {
 	assert.Len(t, ps, 0)
 	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 3, HasPayload: true, PayloadUnitStartIndicator: true, PID: 1}})
 	assert.Len(t, ps, 2)
-	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 5, HasPayload: true, PID: 1}})
+	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 4, HasPayload: true, PID: 1}})
 	assert.Len(t, ps, 0)
-	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 6, HasPayload: true, PayloadUnitStartIndicator: true, PID: 1}})
-	assert.Len(t, ps, 1)
-	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 7, HasPayload: true, PID: 1}})
-	assert.Len(t, ps, 0)
-	ps = b.dumpUnlocked()
+	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 5, HasPayload: true, PayloadUnitStartIndicator: true, PID: 1}})
 	assert.Len(t, ps, 2)
-	assert.Equal(t, uint16(1), ps[0].Header.PID)
-	ps = b.dumpUnlocked()
-	assert.Len(t, ps, 1)
-	assert.Equal(t, uint16(2), ps[0].Header.PID)
+	ps = b.addUnlocked(&Packet{Header: PacketHeader{ContinuityCounter: 6, HasPayload: true, PID: 1}})
+	assert.Len(t, ps, 0)
 	ps = b.dumpUnlocked()
 	assert.Len(t, ps, 0)
+	ps = b.dumpUnlocked()
+	assert.Len(t, ps, 0)
+	ps = b.dumpUnlocked()
+	assert.Len(t, ps, 0)
+
+	stats := b.Stats()
+	assert.Equal(t, 2, stats.DroppedPayloadsByReason[PacketPoolDropReasonEndOfInput])
 }
 
 func TestPacketPoolWithRarePackets(t *testing.T) {
@@ -139,4 +140,215 @@ func TestPacketPoolBoundedPESCompletesWithoutNextStart(t *testing.T) {
 	assert.Empty(t, b.addUnlocked(packets[1]))
 	assert.Equal(t, packets, b.addUnlocked(packets[2]))
 	assert.Empty(t, b.dumpUnlocked())
+}
+
+func TestPacketPoolBoundedPESWithTrailingBytes(t *testing.T) {
+	pp := newPacketPool(nil)
+	first := testPESPacket(256, 0, true, 7, 3)
+	trailing := &Packet{
+		Header: PacketHeader{
+			ContinuityCounter: 1,
+			HasPayload:        true,
+			PID:               256,
+		},
+		Payload: []byte{0xff},
+	}
+	next := testPESPacket(256, 2, true, 7, 3)
+
+	assert.Empty(t, pp.addUnlocked(first))
+	assert.Equal(t, []*Packet{first, trailing}, pp.addUnlocked(trailing))
+	assert.Empty(t, pp.addUnlocked(next))
+}
+
+func TestPacketPoolReclaimsInactivePIDWithoutBlockingOthers(t *testing.T) {
+	pp := newPacketPoolWithLimits(nil, nil, 2, 3)
+
+	stalledStart := testPESPacket(256, 0, true, 0, 10)
+	stalledContinue := testPESPacket(256, 1, false, 0, 10)
+	otherStart := testPESPacket(257, 0, true, 3, 0)
+	otherNext := testPESPacket(257, 1, true, 3, 0)
+	activeStart := testPESPacket(258, 0, true, 0, 10)
+	activeContinue := testPESPacket(258, 1, false, 0, 10)
+
+	assert.Empty(t, pp.addUnlocked(stalledStart))
+	assert.Empty(t, pp.addUnlocked(stalledContinue))
+
+	// Packets on another PID remain deliverable while the stalled PID is aging.
+	assert.Equal(t, []*Packet{otherStart}, pp.addUnlocked(otherStart))
+	assert.Equal(t, []*Packet{otherNext}, pp.addUnlocked(otherNext))
+	assert.Empty(t, pp.addUnlocked(activeStart))
+	assert.Empty(t, pp.addUnlocked(activeContinue))
+
+	stats := pp.Stats()
+	assert.Equal(t, 2, stats.BufferedPackets)
+	assert.Equal(t, 1, stats.DroppedPayloadsByReason[PacketPoolDropReasonInactivity])
+	assert.Equal(t, 2, stats.DroppedPackets)
+	assert.Equal(t, 38, stats.DroppedBytes)
+	assert.Equal(t, 3, stats.HighWaterMarkPackets)
+	assert.Equal(t, map[uint32]int{258: 2}, stats.BufferedPacketsPerPID)
+	assert.Equal(t, map[uint32]int{258: 38}, stats.BufferedBytesPerPID)
+}
+
+func TestPacketPoolCanDisableInactivityReclamation(t *testing.T) {
+	pp := newPacketPoolWithLimits(nil, nil, -1, 1)
+	pp.addUnlocked(testPESPacket(256, 0, true, 0, 10))
+	pp.addUnlocked(testPESPacket(257, 0, true, 0, 10))
+	for i := 1; i < 10; i++ {
+		pp.addUnlocked(testPESPacket(257, uint8(i), true, 3, 0))
+	}
+
+	stats := pp.Stats()
+	assert.Empty(t, stats.DroppedPayloadsByReason)
+	assert.Equal(t, 2, stats.BufferedPackets)
+}
+
+func TestPacketPoolKeepsActiveLongUnboundedPES(t *testing.T) {
+	pp := newPacketPoolWithLimits(nil, nil, 1, 4)
+
+	videoStart := testPESPacket(256, 0, true, 0, 100)
+	videoContinue := testPESPacket(256, 1, false, 0, 100)
+	otherStart := testPESPacket(257, 0, true, 0, 11)
+	otherContinue := testPESPacket(257, 1, false, 0, 11)
+
+	assert.Empty(t, pp.addUnlocked(videoStart))
+	assert.Empty(t, pp.addUnlocked(videoContinue))
+	pp.addUnlocked(testPESPacket(258, 0, true, 6, 0))
+
+	// The video PID is still active, so it is eligible to exceed the watermark.
+	assert.Empty(t, pp.addUnlocked(otherStart))
+	assert.Empty(t, pp.addUnlocked(otherContinue))
+
+	stats := pp.Stats()
+	assert.Equal(t, 5, stats.BufferedPackets)
+	assert.Empty(t, stats.DroppedPayloadsByReason)
+	assert.Equal(t, 5, stats.HighWaterMarkPackets)
+
+	nextVideo := testPESPacket(256, 2, true, 0, 100)
+	assert.Equal(t, []*Packet{videoStart, videoContinue}, pp.addUnlocked(nextVideo))
+}
+
+func TestPacketPoolPSIDoesNotWaitForStalledPES(t *testing.T) {
+	pp := newPacketPool(nil)
+
+	pesStart := testPESPacket(256, 0, true, 0, 10)
+	pesContinue := testPESPacket(256, 1, false, 0, 10)
+	psi := &Packet{
+		Header: PacketHeader{
+			ContinuityCounter:         0,
+			HasPayload:                true,
+			PID:                       PIDPAT,
+			PayloadUnitStartIndicator: true,
+		},
+		Payload: []byte{0, 0x00, 0x00, 0x00, 0xff, 0xff},
+	}
+
+	assert.Empty(t, pp.addUnlocked(pesStart))
+	assert.Empty(t, pp.addUnlocked(pesContinue))
+	assert.Equal(t, []*Packet{psi}, pp.addUnlocked(psi))
+
+	stats := pp.Stats()
+	assert.Equal(t, 2, stats.BufferedPackets)
+	assert.Empty(t, stats.DroppedPayloadsByReason)
+}
+
+func TestPacketPoolDropsIncompletePSIOnNextSection(t *testing.T) {
+	pp := newPacketPool(nil)
+	first := &Packet{
+		Header: PacketHeader{
+			ContinuityCounter:         0,
+			HasPayload:                true,
+			PID:                       PIDPAT,
+			PayloadUnitStartIndicator: true,
+		},
+		Payload: []byte{0, 0x00, 0x00, 0x01},
+	}
+	next := &Packet{
+		Header: PacketHeader{
+			ContinuityCounter:         1,
+			HasPayload:                true,
+			PID:                       PIDPAT,
+			PayloadUnitStartIndicator: true,
+		},
+		Payload: []byte{0, 0x00, 0x00, 0x00, 0xff, 0xff},
+	}
+
+	assert.Empty(t, pp.addUnlocked(first))
+	assert.Empty(t, pp.addUnlocked(next))
+
+	stats := pp.Stats()
+	assert.Equal(t, 1, stats.DroppedPayloadsByReason[PacketPoolDropReasonNewPayloadUnit])
+	assert.Equal(t, 1, stats.DroppedPackets)
+	assert.Equal(t, 1, stats.BufferedPackets)
+}
+
+func TestPacketPoolDiscardsIncompleteUnitsAtRecoveryAndEOF(t *testing.T) {
+	pp := newPacketPool(nil)
+
+	start := testPESPacket(256, 0, true, 50, 11)
+	continued := testPESPacket(256, 1, false, 50, 11)
+
+	// A CC gap without a payload start cannot continue the old PES.
+	recovery := testPESPacket(256, 5, false, 50, 11)
+	recovery.Header.HasAdaptationField = true
+	recovery.AdaptationField = &PacketAdaptationField{DiscontinuityIndicator: true}
+	assert.Empty(t, pp.addUnlocked(start))
+	assert.Empty(t, pp.addUnlocked(continued))
+	assert.Empty(t, pp.addUnlocked(recovery))
+
+	stats := pp.Stats()
+	assert.Equal(t, 2, stats.DroppedPayloadsByReason[PacketPoolDropReasonTransportDiscontinuity])
+	assert.Equal(t, 3, stats.DroppedPackets)
+	assert.Equal(t, 0, stats.BufferedPackets)
+
+	// A continuation that is not a replacement payload start is also discarded.
+	orphan := testPESPacket(256, 5, false, 50, 11)
+	assert.Empty(t, pp.addUnlocked(orphan))
+	assert.Equal(t, 3, pp.Stats().DroppedPayloads)
+	assert.Equal(t, 4, pp.Stats().DroppedPackets)
+	assert.Equal(t, 0, pp.Stats().BufferedPackets)
+
+	// A replacement start followed by EOF before its declared length is also dropped.
+	replacementStart := testPESPacket(256, 6, true, 50, 11)
+	replacementContinue := testPESPacket(256, 7, false, 50, 11)
+	assert.Empty(t, pp.addUnlocked(replacementStart))
+	assert.Empty(t, pp.addUnlocked(replacementContinue))
+	assert.Empty(t, pp.dumpUnlocked())
+
+	stats = pp.Stats()
+	assert.Equal(t, 1, stats.DroppedPayloadsByReason[PacketPoolDropReasonEndOfInput])
+	assert.Equal(t, 6, stats.DroppedPackets)
+	assert.Equal(t, 0, stats.BufferedPackets)
+}
+
+func TestPacketPoolDropsPIDOnStreamSwitch(t *testing.T) {
+	pp := newPacketPool(nil)
+	stalledStart := testPESPacket(256, 0, true, 0, 10)
+	stalledContinue := testPESPacket(256, 1, false, 0, 10)
+	other := testPESPacket(257, 0, true, 0, 10)
+
+	assert.Empty(t, pp.addUnlocked(stalledStart))
+	assert.Empty(t, pp.addUnlocked(stalledContinue))
+	assert.Empty(t, pp.addUnlocked(other))
+
+	pp.dropPIDUnlocked(256, PacketPoolDropReasonStreamSwitch)
+
+	stats := pp.Stats()
+	assert.Equal(t, 1, stats.BufferedPackets)
+	assert.Equal(t, 1, stats.DroppedPayloadsByReason[PacketPoolDropReasonStreamSwitch])
+	assert.Equal(t, 2, stats.DroppedPackets)
+	assert.Equal(t, map[uint32]int{257: 1}, stats.BufferedPacketsPerPID)
+}
+
+func testPESPacket(pid uint16, cc uint8, pusi bool, packetLength uint16, dataLen int) *Packet {
+	payload := []byte{0, 0, 1, 0xe0, byte(packetLength >> 8), byte(packetLength), 0x80, 0, 0}
+	payload = append(payload, make([]byte, dataLen)...)
+	return &Packet{
+		Header: PacketHeader{
+			ContinuityCounter:         cc,
+			HasPayload:                true,
+			PID:                       pid,
+			PayloadUnitStartIndicator: pusi,
+		},
+		Payload: payload,
+	}
 }

@@ -30,6 +30,8 @@ type Demuxer struct {
 	optPacketSize    int
 	optPacketsParser PacketsParser
 	optPacketSkipper PacketSkipper
+	optPoolHighWater int
+	optPoolInactive  int
 
 	packetBuffer *packetBuffer
 	packetPool   *packetPool
@@ -56,12 +58,12 @@ func NewDemuxer(ctx context.Context, r io.Reader, opts ...func(*Demuxer)) (d *De
 		r:          r,
 		streamMap:  newElementaryStreamMap(),
 	}
-	d.packetPool = newPacketPool(d.programMap)
-
 	// Apply options
 	for _, opt := range opts {
 		opt(d)
 	}
+
+	d.packetPool = newPacketPoolWithLimits(d.programMap, d.streamMap, d.optPoolHighWater, d.optPoolInactive)
 
 	return
 }
@@ -91,6 +93,22 @@ func DemuxerOptPacketsParser(p PacketsParser) func(*Demuxer) {
 func DemuxerOptPacketSkipper(s PacketSkipper) func(*Demuxer) {
 	return func(d *Demuxer) {
 		d.optPacketSkipper = s
+	}
+}
+
+// DemuxerOptPacketPoolHighWaterMark sets the number of buffered packets at
+// which inactive PIDs can be reclaimed. A negative value disables reclamation.
+func DemuxerOptPacketPoolHighWaterMark(packets int) func(*Demuxer) {
+	return func(d *Demuxer) {
+		d.optPoolHighWater = packets
+	}
+}
+
+// DemuxerOptPacketPoolInactivityLimit sets how many packets another PID may be
+// processed before an untouched PID is considered inactive.
+func DemuxerOptPacketPoolInactivityLimit(packets int) func(*Demuxer) {
+	return func(d *Demuxer) {
+		d.optPoolInactive = packets
 	}
 }
 
@@ -202,8 +220,18 @@ func (dmx *Demuxer) updateData(ds []*DemuxerData) (d *DemuxerData) {
 				}
 			}
 			if v.PMT != nil {
+				oldPIDs := dmx.streamMap.pidsUnlocked()
+				newPIDs := make(map[uint32]struct{}, len(v.PMT.ElementaryStreams))
 				for _, es := range v.PMT.ElementaryStreams {
+					pid := uint32(es.ElementaryPID)
+					newPIDs[pid] = struct{}{}
 					dmx.streamMap.setUnlocked(es.ElementaryPID, v.PMT.ProgramNumber)
+				}
+				for pid := range oldPIDs {
+					if _, ok := newPIDs[pid]; !ok {
+						dmx.streamMap.unsetUnlocked(uint16(pid))
+						dmx.packetPool.dropPIDUnlocked(pid, PacketPoolDropReasonStreamSwitch)
+					}
 				}
 			}
 		}
@@ -211,11 +239,16 @@ func (dmx *Demuxer) updateData(ds []*DemuxerData) (d *DemuxerData) {
 	return
 }
 
+// PacketPoolStats returns a snapshot of packet assembly buffering and recovery.
+func (dmx *Demuxer) PacketPoolStats() PacketPoolStats {
+	return dmx.packetPool.Stats()
+}
+
 // Rewind rewinds the demuxer reader
 func (dmx *Demuxer) Rewind() (n int64, err error) {
 	dmx.dataBuffer = []*DemuxerData{}
 	dmx.packetBuffer = nil
-	dmx.packetPool = newPacketPool(dmx.programMap)
+	dmx.packetPool = newPacketPoolWithLimits(dmx.programMap, dmx.streamMap, dmx.optPoolHighWater, dmx.optPoolInactive)
 	if n, err = rewind(dmx.r); err != nil {
 		err = fmt.Errorf("astits: rewinding reader failed: %w", err)
 		return

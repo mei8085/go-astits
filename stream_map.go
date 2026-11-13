@@ -27,3 +27,11 @@ func (m elementaryStreamMap) existsUnlocked(pid uint16) (ok bool) {
 func (m elementaryStreamMap) unsetUnlocked(pid uint16) {
 	delete(m.es, uint32(pid))
 }
+
+func (m elementaryStreamMap) pidsUnlocked() map[uint32]struct{} {
+	pids := make(map[uint32]struct{}, len(m.es))
+	for pid := range m.es {
+		pids[pid] = struct{}{}
+	}
+	return pids
+}

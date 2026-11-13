@@ -140,6 +140,14 @@ p := func(ps []*astits.Packet) (ds []*astits.Data, skip bool, err error) {
 dmx := NewDemuxer(ctx, f, DemuxerOptPacketSize(192), DemuxerOptPacketsParser(p))
 ```
 
+### Bounded PES assembly
+
+PES packets are assembled independently per PID. Unbounded video PES packets (PES packet length zero) are never cut by a size limit: they remain queued until the next payload-unit-start indicator marks their end. Bounded packets are emitted as soon as their declared length has been received.
+
+When the total number of queued packets reaches the high-water mark, packet accumulators whose PID has been inactive for the configured number of transport packets can be reclaimed. An active long PES can still exceed the high-water mark. The defaults can be changed with `DemuxerOptPacketPoolHighWaterMark` and `DemuxerOptPacketPoolInactivityLimit`; use a negative high-water mark to disable inactivity reclamation.
+
+`PacketPoolStats` reports current and high-water usage, per-PID queued packet counts and bytes, and the reason for every discarded incomplete payload: transport discontinuity, replacement by a new payload unit, stream switch, inactivity, or end of input. Complete payloads and PSI updates on other PIDs are not blocked by a stalled PID.
+
 # CLI
 
 This library provides 2 CLIs that will automatically get installed in `GOPATH/bin` on `go get` execution.
