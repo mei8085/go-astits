@@ -45,6 +45,23 @@ type PMTData struct {
 	ProgramNumber      uint16
 }
 
+// clone returns a deep copy of the PMT data so a candidate configuration can
+// be built and validated without mutating the live one.
+func (d PMTData) clone() *PMTData {
+	streams := make([]*PMTElementaryStream, len(d.ElementaryStreams))
+	copy(streams, d.ElementaryStreams)
+
+	descriptors := make([]*Descriptor, len(d.ProgramDescriptors))
+	copy(descriptors, d.ProgramDescriptors)
+
+	return &PMTData{
+		ElementaryStreams:  streams,
+		PCRPID:             d.PCRPID,
+		ProgramDescriptors: descriptors,
+		ProgramNumber:      d.ProgramNumber,
+	}
+}
+
 // PMTElementaryStream represents a PMT elementary stream
 type PMTElementaryStream struct {
 	ElementaryPID               uint16        // The packet identifier that contains the stream type data.

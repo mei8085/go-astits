@@ -3,6 +3,7 @@ package astits
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/asticode/go-astikit"
@@ -218,7 +219,10 @@ func TestMuxer_WriteTables_Error(t *testing.T) {
 	assert.NoError(t, err)
 
 	_, err = muxer.WriteTables()
-	assert.Equal(t, ErrPCRPIDInvalid, err)
+	twe := &TablesWriteError{}
+	assert.True(t, errors.As(err, &twe))
+	assert.True(t, errors.Is(err, ErrPCRPIDInvalid))
+	assert.Equal(t, 0, twe.PacketsWritten)
 }
 
 func TestMuxer_AddElementaryStream(t *testing.T) {

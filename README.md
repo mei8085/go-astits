@@ -124,6 +124,43 @@ mx.WriteData(&astits.MuxerData{
 })
 ```
 
+### Switch several streams atomically
+
+Adding or removing streams one by one can momentarily produce an output whose
+program table and media PIDs contradict each other. Use
+`UpdateElementaryStreams` to add, remove and replace streams (and move the PCR
+PID) in one validated batch:
+
+```go
+// The whole batch is validated before anything is changed. A duplicated PID, an
+// unknown removed PID or a PCR PID absent from the result returns an error and
+// leaves the previous, still-outputtable configuration untouched.
+err := mx.UpdateElementaryStreams(astits.MuxerStreamsUpdate{
+    Add:    []astits.PMTElementaryStream{
+        {ElementaryPID: 0x1500, StreamType: astits.StreamTypeH264Video},
+        {ElementaryPID: 0x1501, StreamType: astits.StreamTypeAACAudio},
+    },
+    Remove: []uint16{0x1234},
+    PCRPID: 0x1500,
+})
+```
+
+On success the change takes effect at a single boundary: the next
+`WriteData` call first emits a complete, consistent PAT+PMT pair and only then
+the first media packets of the new configuration. The boundary can also be
+emitted explicitly with `FlushTables`, and `TablesDirty` reports whether a
+boundary is pending.
+
+If the underlying writer fails halfway through the tables, `WriteTables` and
+`FlushTables` return an `*astits.TablesWriteError` whose `PacketsWritten` field
+counts the complete TS packets already emitted. The muxer state and table
+version/continuity counters do not advance, so the same boundary can be retried
+(rewind a seekable writer by `PacketsWritten` packets first to avoid duplicate
+tables) or the batch can be discarded with
+`RollbackElementaryStreamsUpdate` to keep outputting the previous
+configuration. The legacy per-stream `AddElementaryStream`,
+`RemoveElementaryStream` and `SetPCRPID` methods keep their original behavior.
+
 ## Options
 
 In order to pass options to the demuxer or the muxer, look for the methods prefixed with `DemuxerOpt` or `MuxerOpt` and add them upon calling `NewDemuxer` or `NewMuxer` :
